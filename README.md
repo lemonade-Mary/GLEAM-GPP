@@ -1,23 +1,34 @@
 # GLEAM-GPP
 
-用于云南省土壤水分（GLEAM）与 GPP（FluxSat）联合干旱分析。
+云南省干旱-植被多源联合分析代码。
 
-## 文件
+## 主脚本
 
-- `yunnan_drought_analysis.py`：脚本版流程（CLI 运行）。
-- `yunnan_drought_analysis_notebook.ipynb`：Notebook 分块版流程，包含 NDVI/EVI、GOSIF、SPEI 与 2009-2015 连续小干旱机器学习分析。
-
-## Notebook 主要内容
-
-1. 云南省土壤水分与 GPP 当月去趋势异常时间序列（带坐标和单位）。
-2. NDVI/EVI（MOD13C2）与 GOSIF 异常计算，并与干旱指标做同步性对比。
-3. SPEI 月尺度子图（12个月）及区域时间序列融合。
-4. 机器学习模型比较（Linear/Ridge/RF/GBDT/SVR），分析连续小干旱对 GPP 异常影响。
+- `yunnan_drought_analysis.py`：整合版脚本，已把以下需求统一到一个 `.py` 中：
+  1. 土壤水分与 GPP 的当月去趋势异常时间序列；
+  2. 2009-2010 干旱最严重区域识别及该区域 GPP 异常对比；
+  3. 按 IGBP 土地利用类型分析植被恢复时间；
+  4. 引入 NDVI/EVI、GOSIF 做同步性对比；
+  5. 引入 SPEI（12个月 nc）并进行 2009-2015 连续小干旱机器学习影响分析。
 
 ## 依赖
 
 ```bash
-pip install geopandas rasterio xarray scipy numpy pandas matplotlib seaborn scikit-learn
+pip install geopandas rasterio xarray scipy numpy pandas matplotlib seaborn scikit-learn affine
 ```
 
-另需可用的 GDAL Python 绑定（`from osgeo import gdal`）。
+并确保可用：`from osgeo import gdal`（用于 MOD13C2 HDF 读取）。
+
+## 用法示例
+
+```bash
+python yunnan_drought_analysis.py \
+  --shapefile "E:/大创/省份边界shp/云南省.shp" \
+  --gpp-dir "G:/数据/FluxSat/FluxSat_GPP_2000_2022" \
+  --sm-nc "D:/GLEAM/v3.8a/SMroot_1980-2022_GLEAM_v3.8a_MO.nc" \
+  --landcover "E:/大创/MCD12Q1_IGBP_0p05deg_2010.tif" \
+  --modis-dir "G:/modis" \
+  --gosif-dir "G:/数据/Orig" \
+  --spei-dir "D:/spei" \
+  --outdir "outputs"
+```
