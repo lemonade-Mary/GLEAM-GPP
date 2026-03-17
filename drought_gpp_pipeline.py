@@ -13,7 +13,7 @@ import pandas as pd
 import rasterio
 import xarray as xr
 from rasterio.mask import mask
-from rasterio.transform import from_origin
+from rasterio.transform import from_bounds, from_origin
 from rasterio.warp import Resampling, reproject
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -167,6 +167,42 @@ def load_sm_era5_stack(sm_nc, sm_vars, shapefile_gdf, period):
         da = da.rio.clip(shp.geometry, shp.crs, drop=True, all_touched=True)
         da_list.append(da)
     return da_list
+
+
+def _da_to_stack_and_transform(da):
+    """将 DataArray(time, y, x) 转为 numpy 3D，并构建对应 transform/crs。"""
+    y_name = "latitude" if "latitude" in da.dims else "lat"
+    x_name = "longitude" if "longitude" in da.dims else "lon"
+    y = da[y_name].values
+    x = da[x_name].values
+    west, east = float(np.nanmin(x)), float(np.nanmax(x))
+    south, north = float(np.nanmin(y)), float(np.nanmax(y))
+    width, height = len(x), len(y)
+    transform = from_bounds(west, south, east, north, width, height)
+    stack = da.transpose("time", y_name, x_name).values
+    crs = da.rio.crs if hasattr(da, "rio") else "EPSG:4326"
+    return stack, transform, crs
+
+
+def reproject_stack_to_match(src_stack, src_transform, src_crs, dst_shape, dst_transform, dst_crs, resampling=Resampling.bilinear):
+    """将 3D 时序栅格重投影/重采样到目标网格。"""
+    t, _, _ = src_stack.shape
+    out = np.full((t, dst_shape[0], dst_shape[1]), np.nan, dtype=float)
+    for i in range(t):
+        dst = np.full(dst_shape, np.nan, dtype=np.float32)
+        reproject(
+            source=src_stack[i].astype(np.float32),
+            destination=dst,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+            resampling=resampling,
+        )
+        out[i] = dst
+    return out
 
 
 def load_spei03_series(spei_file: str, min_lon, max_lon, min_lat, max_lat, period):
@@ -394,7 +430,19 @@ def main(args):
 
     gpp_stack, gpp_transform, gpp_crs, _ = load_gpp_stack(Path(args.gpp_dir), shapefile, period, args.gpp_pattern)
     sm1, sm2, sm3, sm4 = load_sm_era5_stack(args.era5_path, ["swvl1", "swvl2", "swvl3", "swvl4"], shapefile, period)
-    sm_era5 = compute_sm_era5_xr(sm1, sm2, sm3, sm4).transpose("time", ...).values
+    sm_era5_da = compute_sm_era5_xr(sm1, sm2, sm3, sm4)
+    sm_era5_stack, sm_transform, sm_crs = _da_to_stack_and_transform(sm_era5_da)
+
+    # 关键修复：将 ERA5 土壤湿度统一到 GPP 网格，避免与 landcover/GPP 维度不一致
+    sm_era5 = reproject_stack_to_match(
+        sm_era5_stack,
+        sm_transform,
+        sm_crs,
+        gpp_stack.shape[1:],
+        gpp_transform,
+        gpp_crs,
+        resampling=Resampling.bilinear,
+    )
 
     gpp_anom = compute_pixelwise_detrended_anomaly(gpp_stack, period)
     sm_anom = compute_pixelwise_detrended_anomaly(sm_era5, period)
