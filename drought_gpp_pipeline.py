@@ -11,11 +11,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import rasterio
-import seaborn as sns
 import xarray as xr
-from affine import Affine
 from rasterio.mask import mask
-from rasterio.transform import from_bounds, from_origin
+from rasterio.transform import from_origin
 from rasterio.warp import Resampling, reproject
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -35,17 +33,12 @@ def month_range(start: str, end: str) -> pd.DatetimeIndex:
 
 def reproject_resample_to_wgs84(input_tif, output_tif, resolution=0.05, resampling_method="bilinear"):
     """✅可直接使用：将栅格统一到 WGS84 + 0.05°。"""
-    resampling_dict = {
-        "nearest": Resampling.nearest,
-        "bilinear": Resampling.bilinear,
-        "cubic": Resampling.cubic,
-    }
+    resampling_dict = {"nearest": Resampling.nearest, "bilinear": Resampling.bilinear, "cubic": Resampling.cubic}
     with rasterio.open(input_tif) as src:
         left, bottom, right, top = src.bounds
         dst_transform = from_origin(left, top, resolution, resolution)
         dst_width = int((right - left) / resolution)
         dst_height = int((top - bottom) / resolution)
-
         dst_array = np.empty((dst_height, dst_width), dtype=np.float32)
         reproject(
             source=rasterio.band(src, 1),
@@ -56,7 +49,6 @@ def reproject_resample_to_wgs84(input_tif, output_tif, resolution=0.05, resampli
             dst_crs="EPSG:4326",
             resampling=resampling_dict[resampling_method],
         )
-
         profile = src.profile
         profile.update(crs="EPSG:4326", transform=dst_transform, width=dst_width, height=dst_height, dtype="float32")
         with rasterio.open(output_tif, "w", **profile) as dst:
@@ -68,10 +60,8 @@ def compute_monthly_detrended_anomaly_df(series, varname):
     df = pd.DataFrame(series)
     df.columns = [varname]
     df.index = pd.to_datetime(df.index)
-
     climatology = df.groupby(df.index.month).transform("mean")
     df["anomaly"] = df[varname] - climatology[varname]
-
     x = np.arange(len(df))
     mask_valid = ~df["anomaly"].isna()
     coef = np.polyfit(x[mask_valid], df["anomaly"][mask_valid], 1)
@@ -85,7 +75,7 @@ def compute_monthly_detrended_anomaly(series: pd.Series) -> pd.Series:
 
 
 def masked_mean_raster(path: Path, shapefile: gpd.GeoDataFrame) -> float:
-    """❗重写：原函数缺少 from_bounds 导入并且未做真正矢量掩膜；这里改为 mask。"""
+    """❗重写：使用真实矢量掩膜而不是 bbox-window。"""
     with rasterio.open(path) as src:
         shp = shapefile.to_crs(src.crs)
         out_img, _ = mask(src, [shp.geometry.unary_union], crop=True)
@@ -164,17 +154,32 @@ def load_sm_era5_stack(sm_nc, sm_vars, shapefile_gdf, period):
     ds = xr.open_dataset(sm_nc)
     da_list = []
     shp = shapefile_gdf.to_crs("EPSG:4326")
-
     for var in sm_vars:
         da = ds[var]
         if "valid_time" in da.coords:
             da = da.rename({"valid_time": "time"})
         da["time"] = da.indexes["time"].to_period("M").to_timestamp()
         da = da.sel(time=slice(period[0], period[-1]))
-        da = da.rio.write_crs("EPSG:4326").rio.set_spatial_dims(x_dim="longitude" if "longitude" in da.dims else "lon", y_dim="latitude" if "latitude" in da.dims else "lat")
+        da = da.rio.write_crs("EPSG:4326").rio.set_spatial_dims(
+            x_dim="longitude" if "longitude" in da.dims else "lon",
+            y_dim="latitude" if "latitude" in da.dims else "lat",
+        )
         da = da.rio.clip(shp.geometry, shp.crs, drop=True, all_touched=True)
         da_list.append(da)
     return da_list
+
+
+def load_spei03_series(spei_file: str, min_lon, max_lon, min_lat, max_lat, period):
+    """✅可直接使用：读取单个 SPEI03 netCDF 的区域平均序列。"""
+    ds = xr.open_dataset(spei_file)
+    lat_values = ds["lat"].values
+    lat_slice = slice(min_lat, max_lat) if lat_values[0] < lat_values[-1] else slice(max_lat, min_lat)
+    spei03_series = ds["spei"].sel(lat=lat_slice, lon=slice(min_lon, max_lon)).mean(dim=["lat", "lon"]).to_pandas()
+    spei03_series.index = pd.to_datetime(spei03_series.index)
+    spei03_series.name = "spei03"
+    if period is not None:
+        spei03_series = spei03_series.loc[pd.to_datetime(period[0]): pd.to_datetime(period[-1])]
+    return spei03_series
 
 
 def identify_drought_events(spei_series: pd.Series, sm_series: pd.Series, spei_thr=-0.5, sm_quantile=0.2):
@@ -183,27 +188,24 @@ def identify_drought_events(spei_series: pd.Series, sm_series: pd.Series, spei_t
     sm_thr = df["sm"].quantile(sm_quantile)
     drought = (df["spei"] <= spei_thr) & (df["sm"] <= sm_thr)
 
-    events = []
-    in_evt = False
-    start = None
+    events, in_evt, start = [], False, None
+    prev = None
     for t, flag in drought.items():
         if flag and not in_evt:
             in_evt, start = True, t
         if (not flag) and in_evt:
             end = prev
             seg = df.loc[start:end]
-            events.append(
-                {
-                    "start": start,
-                    "end": end,
-                    "duration_months": len(seg),
-                    "intensity_spei": float(seg["spei"].mean()),
-                    "intensity_sm": float(seg["sm"].mean()),
-                }
-            )
+            events.append({
+                "start": start,
+                "end": end,
+                "duration_months": len(seg),
+                "intensity_spei": float(seg["spei"].mean()),
+                "intensity_sm": float(seg["sm"].mean()),
+            })
             in_evt = False
         prev = t
-    if in_evt:
+    if in_evt and prev is not None:
         seg = df.loc[start:prev]
         events.append({"start": start, "end": prev, "duration_months": len(seg), "intensity_spei": float(seg["spei"].mean()), "intensity_sm": float(seg["sm"].mean())})
     return pd.DataFrame(events)
@@ -232,6 +234,50 @@ def compute_resistance_resilience(gpp_series: pd.Series, drought_events: pd.Data
     return pd.DataFrame(out)
 
 
+def map_igbp_to_major(igbp_array: np.ndarray) -> np.ndarray:
+    """新增：将 IGBP 重分类为森林/灌丛/草地/农田四类。"""
+    out = np.full(igbp_array.shape, "other", dtype=object)
+    out[np.isin(igbp_array, [1, 2, 3, 4, 5])] = "forest"
+    out[np.isin(igbp_array, [6, 7])] = "shrub"
+    out[np.isin(igbp_array, [10])] = "grass"
+    out[np.isin(igbp_array, [12, 14])] = "cropland"
+    return out
+
+
+def load_landcover_resampled(landcover_tif: Path, gpp_shape, gpp_transform, gpp_crs):
+    """新增：把土地覆盖重投影到 GPP 网格。"""
+    with rasterio.open(landcover_tif) as src:
+        lc = src.read(1).astype(float)
+        if src.nodata is not None:
+            lc[lc == src.nodata] = np.nan
+        dst = np.full(gpp_shape, np.nan, dtype=float)
+        reproject(
+            source=lc,
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=gpp_transform,
+            dst_crs=gpp_crs,
+            resampling=Resampling.nearest,
+        )
+    return dst
+
+
+def build_vegtype_timeseries(gpp_anom: np.ndarray, sm_anom: np.ndarray, times: pd.DatetimeIndex, lc_major: np.ndarray):
+    """新增：生成按植被类型聚合的时序样本，用于类型差异 + XGBoost。"""
+    records = []
+    for veg in ["forest", "shrub", "grass", "cropland"]:
+        m = lc_major == veg
+        if np.nansum(m) == 0:
+            continue
+        gpp_v = np.nanmean(np.where(m[None, :, :], gpp_anom, np.nan), axis=(1, 2))
+        sm_v = np.nanmean(np.where(m[None, :, :], sm_anom, np.nan), axis=(1, 2))
+        records.append(pd.DataFrame({"time": times, "veg_type": veg, "gpp_anom": gpp_v, "sm_anom": sm_v}))
+    if not records:
+        return pd.DataFrame(columns=["time", "veg_type", "gpp_anom", "sm_anom"])
+    return pd.concat(records, ignore_index=True)
+
+
 def run_xgboost_attribution(df_features: pd.DataFrame, target_col: str = "gpp_anom"):
     """新增：XGBoost + 超参优化 + SHAP 归因。"""
     xgb_mod = importlib.import_module("xgboost")
@@ -242,23 +288,17 @@ def run_xgboost_attribution(df_features: pd.DataFrame, target_col: str = "gpp_an
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = [c for c in X.columns if c not in num_cols]
 
-    pre = ColumnTransformer(
-        transformers=[
-            ("num", Pipeline([("impute", SimpleImputer(strategy="median"))]), num_cols),
-            ("cat", Pipeline([("impute", SimpleImputer(strategy="most_frequent")), ("ohe", OneHotEncoder(handle_unknown="ignore"))]), cat_cols),
-        ]
-    )
+    pre = ColumnTransformer(transformers=[
+        ("num", Pipeline([("impute", SimpleImputer(strategy="median"))]), num_cols),
+        ("cat", Pipeline([("impute", SimpleImputer(strategy="most_frequent")), ("ohe", OneHotEncoder(handle_unknown="ignore"))]), cat_cols),
+    ])
 
     model = xgb_mod.XGBRegressor(objective="reg:squarederror", n_estimators=500, random_state=42)
     pipe = Pipeline([("pre", pre), ("model", model)])
 
-    # 若安装 skopt 则使用贝叶斯优化；否则回退随机搜索
     if importlib.util.find_spec("skopt") is not None:
-        skopt_mod = importlib.import_module("skopt")
-        _ = skopt_mod  # 避免未使用告警
         from skopt import BayesSearchCV
         from skopt.space import Integer, Real
-
         search = BayesSearchCV(
             pipe,
             {
@@ -294,32 +334,54 @@ def run_xgboost_attribution(df_features: pd.DataFrame, target_col: str = "gpp_an
     search.fit(X, y)
     best = search.best_estimator_
     pred = best.predict(X)
-
     X_trans = best.named_steps["pre"].transform(X)
-    booster = best.named_steps["model"]
-    explainer = shap_mod.TreeExplainer(booster)
+    explainer = shap_mod.TreeExplainer(best.named_steps["model"])
     shap_values = explainer.shap_values(X_trans)
-    mean_abs = np.abs(shap_values).mean(axis=0)
-
     return {
         "best_params": search.best_params_,
         "rmse": float(np.sqrt(mean_squared_error(y, pred))),
         "r2": float(r2_score(y, pred)),
-        "mean_abs_shap": mean_abs,
+        "mean_abs_shap": np.abs(shap_values).mean(axis=0),
     }
 
 
-def load_spei03_series(spei_file: str, min_lon, max_lon, min_lat, max_lat, period):
-    """✅可直接使用：读取单个 SPEI03 netCDF 的区域平均序列。"""
-    ds = xr.open_dataset(spei_file)
-    lat_values = ds["lat"].values
-    lat_slice = slice(min_lat, max_lat) if lat_values[0] < lat_values[-1] else slice(max_lat, min_lat)
-    spei03_series = ds["spei"].sel(lat=lat_slice, lon=slice(min_lon, max_lon)).mean(dim=["lat", "lon"]).to_pandas()
-    spei03_series.index = pd.to_datetime(spei03_series.index)
-    spei03_series.name = "spei03"
-    if period is not None:
-        spei03_series = spei03_series.loc[pd.to_datetime(period[0]): pd.to_datetime(period[-1])]
-    return spei03_series
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="2000-2022 干旱-植被生产力分析流程",
+        epilog=(
+            "示例: python drought_gpp_pipeline.py --shapefile E:/.../云南省.shp "
+            "--gpp_dir G:/FluxSat/FluxSat_GPP_2000_2022 --era5_path G:/2000-2022 ERA5.nc "
+            "--spei_file G:/spei/spei03.nc --landcover_tif E:/.../MCD12Q1_IGBP_0p05deg_2010.tif"
+        ),
+    )
+    # 推荐写法：显式参数名
+    parser.add_argument("--shapefile", help="云南省边界shp")
+    parser.add_argument("--gpp_dir", help="FluxSat GPP目录")
+    parser.add_argument("--era5_path", help="ERA5-Land nc文件")
+    parser.add_argument("--spei_file", help="SPEI03 nc文件")
+    parser.add_argument("--landcover_tif", help="MCD12Q1 IGBP土地覆盖")
+
+    # 兼容写法：位置参数（不需要 required）
+    parser.add_argument("shapefile_pos", nargs="?")
+    parser.add_argument("gpp_dir_pos", nargs="?")
+    parser.add_argument("era5_path_pos", nargs="?")
+    parser.add_argument("spei_file_pos", nargs="?")
+
+    parser.add_argument("--start", default="2000-03-01")
+    parser.add_argument("--end", default="2022-03-01")
+    parser.add_argument("--gpp_pattern", default="{year}_{month:02d}_FluxSat.tif")
+    parser.add_argument("--outdir", default="outputs")
+    args = parser.parse_args()
+
+    args.shapefile = args.shapefile or args.shapefile_pos
+    args.gpp_dir = args.gpp_dir or args.gpp_dir_pos
+    args.era5_path = args.era5_path or args.era5_path_pos
+    args.spei_file = args.spei_file or args.spei_file_pos
+
+    missing = [k for k in ["shapefile", "gpp_dir", "era5_path", "spei_file"] if getattr(args, k) is None]
+    if missing:
+        parser.error(f"缺少必要参数: {', '.join(missing)}")
+    return args
 
 
 def main(args):
@@ -330,7 +392,7 @@ def main(args):
     period = month_range(args.start, args.end)
     min_lon, min_lat, max_lon, max_lat = shapefile.total_bounds
 
-    gpp_stack, *_ = load_gpp_stack(Path(args.gpp_dir), shapefile, period, args.gpp_pattern)
+    gpp_stack, gpp_transform, gpp_crs, _ = load_gpp_stack(Path(args.gpp_dir), shapefile, period, args.gpp_pattern)
     sm1, sm2, sm3, sm4 = load_sm_era5_stack(args.era5_path, ["swvl1", "swvl2", "swvl3", "swvl4"], shapefile, period)
     sm_era5 = compute_sm_era5_xr(sm1, sm2, sm3, sm4).transpose("time", ...).values
 
@@ -347,12 +409,23 @@ def main(args):
     rr = compute_resistance_resilience(gpp_mean_series, drought_events)
     rr.to_csv(outdir / "resistance_resilience.csv", index=False, encoding="utf-8-sig")
 
-    df_model = pd.concat([
-        gpp_mean_series,
-        sm_mean_series.shift(1).rename("sm_lag1"),
-        spei03_series.shift(1).rename("spei_lag1"),
-    ], axis=1).dropna()
-    df_model["veg_type"] = "mixed"
+    if args.landcover_tif:
+        lc = load_landcover_resampled(Path(args.landcover_tif), gpp_stack.shape[1:], gpp_transform, gpp_crs)
+        lc_major = map_igbp_to_major(lc)
+        veg_ts = build_vegtype_timeseries(gpp_anom, sm_anom, period, lc_major)
+        veg_ts = veg_ts.merge(spei03_series.rename("spei").reset_index(names="time"), on="time", how="left")
+        veg_ts["sm_lag1"] = veg_ts.groupby("veg_type")["sm_anom"].shift(1)
+        veg_ts["spei_lag1"] = veg_ts.groupby("veg_type")["spei"].shift(1)
+        veg_ts = veg_ts.dropna(subset=["gpp_anom", "sm_lag1", "spei_lag1"])
+        veg_ts.to_csv(outdir / "veg_type_timeseries.csv", index=False, encoding="utf-8-sig")
+        df_model = veg_ts[["gpp_anom", "sm_lag1", "spei_lag1", "veg_type"]].copy()
+    else:
+        df_model = pd.concat([
+            gpp_mean_series,
+            sm_mean_series.shift(1).rename("sm_lag1"),
+            spei03_series.shift(1).rename("spei_lag1"),
+        ], axis=1).dropna()
+        df_model["veg_type"] = "mixed"
 
     result = run_xgboost_attribution(df_model, target_col="gpp_anom")
     with open(outdir / "xgboost_metrics.txt", "w", encoding="utf-8") as f:
@@ -370,13 +443,4 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="2000-2022 干旱-植被生产力分析流程")
-    parser.add_argument("--shapefile", required=True)
-    parser.add_argument("--gpp_dir", required=True)
-    parser.add_argument("--era5_path", required=True)
-    parser.add_argument("--spei_file", required=True)
-    parser.add_argument("--start", default="2000-03-01")
-    parser.add_argument("--end", default="2022-03-01")
-    parser.add_argument("--gpp_pattern", default="{year}_{month:02d}_FluxSat.tif")
-    parser.add_argument("--outdir", default="outputs")
-    main(parser.parse_args())
+    main(parse_args())
