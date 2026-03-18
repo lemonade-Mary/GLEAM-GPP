@@ -9,9 +9,11 @@ matplotlib.rcParams['font.family'] = 'DejaVu Sans'
 matplotlib.rcParams['font.sans-serif'] = ['SimHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
 import rasterio
+import networkx as nx
 import xarray as xr
 from rasterio.mask import mask
 from rasterio.transform import from_bounds, from_origin
@@ -22,6 +24,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
+from sklearn.model_selection import cross_validate
 
 plt.rcParams["font.sans-serif"] = ["SimHei", "Arial Unicode MS", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -518,6 +521,287 @@ def run_xgboost_attribution(df_features: pd.DataFrame, target_col: str = "gpp_an
     }
 
 
+
+def save_array_map(arr, title: str, out_png: Path, cmap="RdYlBu_r", cbar_label=""):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(arr, cmap=cmap)
+    ax.set_title(title)
+    ax.set_xlabel("列")
+    ax.set_ylabel("行")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    if cbar_label:
+        cbar.set_label(cbar_label)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=300)
+    plt.close(fig)
+
+
+def aggregate_by_vegtype(stack: np.ndarray, lc_major: np.ndarray, times: pd.DatetimeIndex, col_name: str):
+    records = []
+    for veg in ["forest", "shrub", "grass", "cropland"]:
+        m = lc_major == veg
+        if np.nansum(m) == 0:
+            continue
+        series = np.nanmean(np.where(m[None, :, :], stack, np.nan), axis=(1, 2))
+        records.append(pd.DataFrame({"time": times, "veg_type": veg, col_name: series}))
+    if not records:
+        return pd.DataFrame(columns=["time", "veg_type", col_name])
+    return pd.concat(records, ignore_index=True)
+
+
+def classify_drought_pixels(spei_series: pd.Series, threshold=-0.5):
+    return spei_series <= threshold
+
+
+def compute_drought_heatmap(sm_anom: np.ndarray, spei_series: pd.Series, threshold=-0.5):
+    drought_mask = classify_drought_pixels(spei_series, threshold).reindex(spei_series.index).values
+    ntime, nrow, ncol = sm_anom.shape
+    spatial_mean = sm_anom.reshape(ntime, -1)
+    spatial_order = np.argsort(np.nanmean(spatial_mean, axis=0))
+    heat = spatial_mean[:, spatial_order].T
+    heat[:, ~drought_mask] = np.nan
+    return heat
+
+
+def build_continuous_drought_graph(drought_events: pd.DataFrame, max_gap_months=3):
+    G = nx.Graph()
+    if drought_events.empty:
+        return G
+    events = drought_events.copy()
+    events["start"] = pd.to_datetime(events["start"])
+    events["end"] = pd.to_datetime(events["end"])
+    for i, row in events.iterrows():
+        G.add_node(i, start=row["start"], end=row["end"], duration=row["duration_months"])
+    for i in range(len(events) - 1):
+        gap = (events.iloc[i + 1]["start"].to_period("M") - events.iloc[i]["end"].to_period("M")).n
+        if gap < max_gap_months:
+            G.add_edge(events.index[i], events.index[i + 1], gap=gap)
+    return G
+
+
+def summarize_event_pixel_response(gpp_anom: np.ndarray, drought_mask_series: pd.Series):
+    drought_mask = drought_mask_series.reindex(drought_mask_series.index).values
+    drought_mean = np.nanmean(gpp_anom[drought_mask], axis=0)
+    normal_mean = np.nanmean(gpp_anom[~drought_mask], axis=0)
+    diff = drought_mean - normal_mean
+    yearly_neg_ratio = {}
+    years = np.unique(drought_mask_series.index.year)
+    for year in years:
+        idx = (drought_mask_series.index.year == year) & drought_mask
+        if idx.sum() == 0:
+            continue
+        year_mean = np.nanmean(gpp_anom[idx], axis=0)
+        yearly_neg_ratio[year] = float(np.nanmean(year_mean < 0))
+    heterogeneity = np.nanstd(gpp_anom[drought_mask], axis=0)
+    return diff, yearly_neg_ratio, heterogeneity
+
+
+def compute_veg_event_box(veg_ts: pd.DataFrame, drought_events: pd.DataFrame):
+    if veg_ts.empty or drought_events.empty:
+        return pd.DataFrame(columns=["veg_type", "event_id", "gpp_anom"])
+    out = []
+    for evt_id, evt in drought_events.reset_index(drop=True).iterrows():
+        mask = (veg_ts["time"] >= pd.to_datetime(evt["start"])) & (veg_ts["time"] <= pd.to_datetime(evt["end"]))
+        tmp = veg_ts.loc[mask, ["veg_type", "gpp_anom"]].copy()
+        tmp["event_id"] = evt_id
+        tmp["intensity_bin"] = pd.cut([evt["intensity_spei"]] * len(tmp), bins=[-np.inf, -1.5, -1.0, -0.5, np.inf], labels=["extreme", "severe", "moderate", "mild"])
+        out.append(tmp)
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=["veg_type", "event_id", "gpp_anom", "intensity_bin"])
+
+
+def build_recovery_trajectories(veg_ts: pd.DataFrame, drought_events: pd.DataFrame, max_months=12):
+    rows = []
+    if veg_ts.empty or drought_events.empty:
+        return pd.DataFrame(columns=["veg_type", "sequence_id", "recovery_month", "relative_gpp"])
+    drought_events = drought_events.copy().reset_index(drop=True)
+    drought_events["sequence_id"] = 1
+    for i in range(1, len(drought_events)):
+        gap = (pd.to_datetime(drought_events.loc[i, "start"]).to_period("M") - pd.to_datetime(drought_events.loc[i - 1, "end"]).to_period("M")).n
+        drought_events.loc[i, "sequence_id"] = drought_events.loc[i - 1, "sequence_id"] + (gap >= 3)
+    for _, evt in drought_events.iterrows():
+        end = pd.to_datetime(evt["end"])
+        for veg, group in veg_ts.groupby("veg_type"):
+            pre = group.loc[group["time"] < pd.to_datetime(evt["start"]), "gpp_anom"].tail(12).mean()
+            if pd.isna(pre) or pre == 0:
+                continue
+            post = group.loc[group["time"] > end].head(max_months).copy()
+            if post.empty:
+                continue
+            post["recovery_month"] = np.arange(1, len(post) + 1)
+            post["relative_gpp"] = post["gpp_anom"] / pre
+            post["veg_type"] = veg
+            post["sequence_id"] = int(evt["sequence_id"])
+            rows.append(post[["veg_type", "sequence_id", "recovery_month", "relative_gpp"]])
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["veg_type", "sequence_id", "recovery_month", "relative_gpp"])
+
+
+def plot_figure1(outdir: Path, dem_arr, spei_series: pd.Series, drought_heat, lc_major: np.ndarray):
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+    im0 = axes[0, 0].imshow(dem_arr, cmap="terrain")
+    axes[0, 0].set_title("(a) 研究区地形阴影")
+    fig.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
+
+    axes[0, 1].plot(spei_series.index, spei_series.values, color="brown")
+    axes[0, 1].axhline(-0.5, ls="--", color="red")
+    axes[0, 1].set_title("(b) 2000-2022年区域平均SPEI")
+    axes[0, 1].xaxis.set_major_locator(mdates.YearLocator(4))
+    axes[0, 1].tick_params(axis="x", rotation=30)
+
+    im2 = axes[1, 0].imshow(drought_heat, aspect="auto", cmap="RdBu_r")
+    axes[1, 0].set_title("(c) 干旱事件时空分布热力图")
+    axes[1, 0].set_xlabel("时间")
+    axes[1, 0].set_ylabel("空间位置(排序后像元)")
+    fig.colorbar(im2, ax=axes[1, 0], fraction=0.046, pad=0.04)
+
+    veg_code = {"other": 0, "forest": 1, "shrub": 2, "grass": 3, "cropland": 4}
+    veg_numeric = np.vectorize(lambda x: veg_code.get(x, 0))(lc_major)
+    im3 = axes[1, 1].imshow(veg_numeric, cmap="Set2", vmin=0, vmax=4)
+    axes[1, 1].set_title("(d) 主要植被类型空间分布")
+    cbar = fig.colorbar(im3, ax=axes[1, 1], fraction=0.046, pad=0.04)
+    cbar.set_ticks([0, 1, 2, 3, 4])
+    cbar.set_ticklabels(["other", "forest", "shrub", "grass", "cropland"])
+
+    fig.tight_layout()
+    fig.savefig(outdir / "Figure1_study_area_overview.png", dpi=300)
+    plt.close(fig)
+
+
+def plot_figure2(outdir: Path, drought_events: pd.DataFrame):
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+    if drought_events.empty:
+        for ax in axes.flat:
+            ax.text(0.5, 0.5, "No drought events", ha="center", va="center")
+            ax.axis("off")
+    else:
+        events = drought_events.copy().reset_index(drop=True)
+        events["start"] = pd.to_datetime(events["start"])
+        events["end"] = pd.to_datetime(events["end"])
+        for i, row in events.iterrows():
+            axes[0, 0].barh(i, (row["end"] - row["start"]).days + 30, left=row["start"], color="tomato")
+        axes[0, 0].set_title("(a) 干旱事件时间轴")
+        axes[0, 0].xaxis.set_major_locator(mdates.YearLocator(2))
+        axes[0, 0].tick_params(axis="x", rotation=30)
+
+        axes[0, 1].boxplot([events["intensity_spei"].dropna(), events["intensity_sm"].dropna()], labels=["SPEI", "SM"])
+        axes[0, 1].set_title("(b) 干旱事件强度分布")
+
+        axes[1, 0].scatter(events["duration_months"], events["intensity_spei"], c=events["intensity_sm"], cmap="viridis")
+        axes[1, 0].set_title("(c) 持续时间与强度")
+        axes[1, 0].set_xlabel("持续时间(月)")
+        axes[1, 0].set_ylabel("SPEI强度")
+
+        G = build_continuous_drought_graph(events)
+        pos = nx.spring_layout(G, seed=42)
+        nx.draw(G, pos, ax=axes[1, 1], with_labels=True, node_color="orange", edge_color="gray")
+        axes[1, 1].set_title("(d) 连续干旱事件序列")
+    fig.tight_layout()
+    fig.savefig(outdir / "Figure2_drought_event_statistics.png", dpi=300)
+    plt.close(fig)
+
+
+def plot_figure3(outdir: Path, gpp_diff_map: np.ndarray, yearly_neg_ratio: dict, gpp_mean_series: pd.Series, veg_gpp_ts: pd.DataFrame, heterogeneity: np.ndarray):
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+    im0 = axes[0, 0].imshow(gpp_diff_map, cmap="RdBu")
+    axes[0, 0].set_title("(a) 干旱期 vs 非干旱期 GPP差异")
+    fig.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
+
+    if yearly_neg_ratio:
+        years = list(yearly_neg_ratio.keys())
+        vals = list(yearly_neg_ratio.values())
+        axes[0, 1].plot(years, vals, marker="o")
+    axes[0, 1].set_title("(b) 年际GPP负异常像元比例")
+    axes[0, 1].set_xlabel("Year")
+    axes[0, 1].set_ylabel("负异常比例")
+
+    axes[1, 0].plot(gpp_mean_series.index, gpp_mean_series.values, label="regional")
+    if not veg_gpp_ts.empty:
+        for veg, group in veg_gpp_ts.groupby("veg_type"):
+            axes[1, 0].plot(group["time"], group["gpp_anom"], label=veg)
+    axes[1, 0].set_title("(c) 典型干旱事件GPP时间序列")
+    axes[1, 0].legend()
+
+    im3 = axes[1, 1].imshow(heterogeneity, cmap="magma")
+    axes[1, 1].set_title("(d) GPP响应空间异质性")
+    fig.colorbar(im3, ax=axes[1, 1], fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(outdir / "Figure3_drought_gpp_spatiotemporal_patterns.png", dpi=300)
+    plt.close(fig)
+
+
+def plot_figure4(outdir: Path, event_box_df: pd.DataFrame, rr_veg: pd.DataFrame, interaction_df: pd.DataFrame, recovery_df: pd.DataFrame):
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+    if not event_box_df.empty:
+        data = [event_box_df.loc[event_box_df["veg_type"] == veg, "gpp_anom"].dropna() for veg in ["forest", "shrub", "grass", "cropland"]]
+        axes[0, 0].boxplot(data, labels=["forest", "shrub", "grass", "cropland"])
+    axes[0, 0].set_title("(a) 各植被类型干旱期GPP变化")
+
+    if not rr_veg.empty:
+        for veg, group in rr_veg.groupby("veg_type"):
+            axes[0, 1].scatter(group["Resistance"], group["Resilience"], label=veg)
+        axes[0, 1].legend()
+    axes[0, 1].set_title("(b) Resistance vs Resilience")
+    axes[0, 1].set_xlabel("Resistance")
+    axes[0, 1].set_ylabel("Resilience")
+
+    if not interaction_df.empty:
+        pivot = interaction_df.pivot(index="intensity_bin", columns="veg_type", values="gpp_decline_ratio")
+        im = axes[1, 0].imshow(pivot.values, aspect="auto", cmap="YlOrRd")
+        axes[1, 0].set_xticks(range(len(pivot.columns)), pivot.columns)
+        axes[1, 0].set_yticks(range(len(pivot.index)), pivot.index)
+        axes[1, 0].set_title("(c) 植被类型×干旱强度交互")
+        fig.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
+
+    if not recovery_df.empty:
+        for (seq, veg), group in recovery_df.groupby(["sequence_id", "veg_type"]):
+            axes[1, 1].plot(group["recovery_month"], group["relative_gpp"], label=f"{veg}-seq{seq}")
+        axes[1, 1].legend(fontsize=8, ncol=2)
+    axes[1, 1].set_title("(d) 不同干旱历史下恢复轨迹")
+    axes[1, 1].set_xlabel("恢复月份")
+    axes[1, 1].set_ylabel("相对GPP")
+
+    fig.tight_layout()
+    fig.savefig(outdir / "Figure4_vegetation_type_differences.png", dpi=300)
+    plt.close(fig)
+
+
+def plot_figure5(outdir: Path, df_model: pd.DataFrame, result: dict):
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+    xgb_mod = importlib.import_module("xgboost")
+    X = df_model.drop(columns=["gpp_anom"])
+    y = df_model["gpp_anom"]
+    X_enc = pd.get_dummies(X)
+    model = xgb_mod.XGBRegressor(objective="reg:squarederror", n_estimators=200, tree_method="hist", random_state=42)
+    cv = TimeSeriesSplit(n_splits=5)
+    scores = cross_validate(model, X_enc, y, cv=cv, scoring={"r2": "r2", "rmse": "neg_root_mean_squared_error"})
+    axes[0, 0].plot(range(1, len(scores["test_r2"]) + 1), scores["test_r2"], marker="o", label="R2")
+    axes[0, 0].plot(range(1, len(scores["test_rmse"]) + 1), -scores["test_rmse"], marker="s", label="RMSE")
+    axes[0, 0].set_title("(a) XGBoost模型性能")
+    axes[0, 0].legend()
+
+    imp = result["importance_df"].head(15).iloc[::-1]
+    axes[0, 1].barh(imp["feature"], imp["importance_gain"], alpha=0.7, label="Gain")
+    axes[0, 1].barh(imp["feature"], imp["importance_shap"], alpha=0.7, label="SHAP")
+    axes[0, 1].set_title("(b) 特征重要性排序")
+    axes[0, 1].legend()
+
+    top_feats = result["importance_df"].head(5)["feature"].tolist()
+    for feat in top_feats:
+        sub = result["importance_df"].loc[result["importance_df"]["feature"] == feat]
+        axes[1, 0].scatter([feat], sub["importance_shap"], s=60)
+    axes[1, 0].set_title("(c) SHAP值散点概览")
+    axes[1, 0].tick_params(axis="x", rotation=30)
+
+    dep_feats = [f for f in result["importance_df"]["feature"] if any(key in f for key in ["sm_", "vpd", "spei"])][:3]
+    for feat in dep_feats:
+        if feat in X_enc.columns:
+            axes[1, 1].scatter(X_enc[feat], np.repeat(result["importance_df"].set_index("feature").loc[feat, "importance_shap"], len(X_enc)), s=8, alpha=0.5, label=feat)
+    axes[1, 1].set_title("(d) 关键特征SHAP依赖图(近似)")
+    axes[1, 1].legend()
+
+    fig.tight_layout()
+    fig.savefig(outdir / "Figure5_xgboost_attribution.png", dpi=300)
+    plt.close(fig)
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="2000-2022 干旱-植被生产力分析流程",
@@ -697,6 +981,39 @@ def main(args):
     plt.tight_layout()
     plt.savefig(outdir / "timeseries_overview.png", dpi=300)
     plt.close()
+
+    drought_mask_series = classify_drought_pixels(spei03_series)
+    gpp_diff_map, yearly_neg_ratio, heterogeneity = summarize_event_pixel_response(gpp_anom, drought_mask_series)
+
+    if args.landcover_tif:
+        dem_arr = np.where(np.isfinite(lc), lc, np.nan)
+        veg_gpp_ts = veg_ts[["time", "veg_type", "gpp_anom"]].copy()
+        event_box_df = compute_veg_event_box(veg_ts, drought_events)
+        rr_veg = []
+        for veg, group in veg_ts.groupby("veg_type"):
+            tmp_rr = compute_resistance_resilience(group.set_index("time")["gpp_anom"], drought_events)
+            if not tmp_rr.empty:
+                tmp_rr["veg_type"] = veg
+                rr_veg.append(tmp_rr)
+        rr_veg = pd.concat(rr_veg, ignore_index=True) if rr_veg else pd.DataFrame(columns=["veg_type", "Resistance", "Resilience"])
+        if not event_box_df.empty:
+            interaction_df = event_box_df.groupby(["veg_type", "intensity_bin"], observed=False)["gpp_anom"].mean().reset_index()
+            interaction_df["gpp_decline_ratio"] = -interaction_df["gpp_anom"]
+        else:
+            interaction_df = pd.DataFrame(columns=["veg_type", "intensity_bin", "gpp_decline_ratio"])
+        recovery_df = build_recovery_trajectories(veg_ts, drought_events)
+        drought_heat = compute_drought_heatmap(sm_anom, spei03_series)
+        plot_figure1(outdir, dem_arr, spei03_series, drought_heat, lc_major)
+        plot_figure4(outdir, event_box_df, rr_veg, interaction_df, recovery_df)
+    else:
+        dem_arr = np.nanmean(gpp_stack, axis=0)
+        veg_gpp_ts = pd.DataFrame(columns=["time", "veg_type", "gpp_anom"])
+        drought_heat = compute_drought_heatmap(sm_anom, spei03_series)
+        plot_figure1(outdir, dem_arr, spei03_series, drought_heat, np.full(gpp_stack.shape[1:], "other", dtype=object))
+
+    plot_figure2(outdir, drought_events)
+    plot_figure3(outdir, gpp_diff_map, yearly_neg_ratio, gpp_mean_series, veg_gpp_ts, heterogeneity)
+    plot_figure5(outdir, df_model, result)
 
 
 if __name__ == "__main__":
