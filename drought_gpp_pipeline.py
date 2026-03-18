@@ -315,7 +315,7 @@ def build_vegtype_timeseries(gpp_anom: np.ndarray, sm_anom: np.ndarray, times: p
 
 
 def run_xgboost_attribution(df_features: pd.DataFrame, target_col: str = "gpp_anom"):
-    """新增：XGBoost + 超参优化 + SHAP 归因。"""
+    """新增：XGBoost + 贝叶斯优化 + SHAP，返回逐变量重要性。"""
     xgb_mod = importlib.import_module("xgboost")
     shap_mod = importlib.import_module("shap")
 
@@ -329,9 +329,15 @@ def run_xgboost_attribution(df_features: pd.DataFrame, target_col: str = "gpp_an
         ("cat", Pipeline([("impute", SimpleImputer(strategy="most_frequent")), ("ohe", OneHotEncoder(handle_unknown="ignore"))]), cat_cols),
     ])
 
-    model = xgb_mod.XGBRegressor(objective="reg:squarederror", n_estimators=500, random_state=42)
+    model = xgb_mod.XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=400,
+        tree_method="hist",
+        random_state=42,
+    )
     pipe = Pipeline([("pre", pre), ("model", model)])
 
+    # 优先使用贝叶斯优化
     if importlib.util.find_spec("skopt") is not None:
         from skopt import BayesSearchCV
         from skopt.space import Integer, Real
@@ -343,13 +349,15 @@ def run_xgboost_attribution(df_features: pd.DataFrame, target_col: str = "gpp_an
                 "model__reg_lambda": Real(1e-3, 10, prior="log-uniform"),
                 "model__subsample": Real(0.5, 1.0),
                 "model__colsample_bytree": Real(0.5, 1.0),
+                "model__min_child_weight": Integer(1, 10),
             },
-            n_iter=25,
+            n_iter=30,
             cv=TimeSeriesSplit(n_splits=5),
             scoring="neg_mean_squared_error",
             random_state=42,
             n_jobs=-1,
         )
+        optimizer_name = "BayesSearchCV"
     else:
         search = RandomizedSearchCV(
             pipe,
@@ -359,6 +367,7 @@ def run_xgboost_attribution(df_features: pd.DataFrame, target_col: str = "gpp_an
                 "model__reg_lambda": np.logspace(-3, 1, 20),
                 "model__subsample": np.linspace(0.5, 1.0, 10),
                 "model__colsample_bytree": np.linspace(0.5, 1.0, 10),
+                "model__min_child_weight": np.arange(1, 11),
             },
             n_iter=30,
             cv=TimeSeriesSplit(n_splits=5),
@@ -366,18 +375,37 @@ def run_xgboost_attribution(df_features: pd.DataFrame, target_col: str = "gpp_an
             random_state=42,
             n_jobs=-1,
         )
+        optimizer_name = "RandomizedSearchCV(fallback)"
 
     search.fit(X, y)
     best = search.best_estimator_
     pred = best.predict(X)
-    X_trans = best.named_steps["pre"].transform(X)
+
+    # 特征名（数值列 + OneHot 后类别列）
+    pre_fitted = best.named_steps["pre"]
+    feature_names = pre_fitted.get_feature_names_out()
+
+    # XGBoost 内置重要性
+    gain_importance = best.named_steps["model"].feature_importances_
+
+    # SHAP重要性
+    X_trans = pre_fitted.transform(X)
     explainer = shap_mod.TreeExplainer(best.named_steps["model"])
     shap_values = explainer.shap_values(X_trans)
+    shap_mean_abs = np.abs(shap_values).mean(axis=0)
+
+    importance_df = pd.DataFrame({
+        "feature": feature_names,
+        "importance_gain": gain_importance,
+        "importance_shap": shap_mean_abs,
+    }).sort_values("importance_shap", ascending=False).reset_index(drop=True)
+
     return {
+        "optimizer": optimizer_name,
         "best_params": search.best_params_,
         "rmse": float(np.sqrt(mean_squared_error(y, pred))),
         "r2": float(r2_score(y, pred)),
-        "mean_abs_shap": np.abs(shap_values).mean(axis=0),
+        "importance_df": importance_df,
     }
 
 
@@ -462,14 +490,18 @@ def main(args):
         lc_major = map_igbp_to_major(lc)
         veg_ts = build_vegtype_timeseries(gpp_anom, sm_anom, period, lc_major)
         veg_ts = veg_ts.merge(spei03_series.rename("spei").reset_index(names="time"), on="time", how="left")
+        veg_ts["sm_curr"] = veg_ts["sm_anom"]
+        veg_ts["spei_curr"] = veg_ts["spei"]
         veg_ts["sm_lag1"] = veg_ts.groupby("veg_type")["sm_anom"].shift(1)
         veg_ts["spei_lag1"] = veg_ts.groupby("veg_type")["spei"].shift(1)
-        veg_ts = veg_ts.dropna(subset=["gpp_anom", "sm_lag1", "spei_lag1"])
+        veg_ts = veg_ts.dropna(subset=["gpp_anom", "sm_curr", "spei_curr", "sm_lag1", "spei_lag1"])
         veg_ts.to_csv(outdir / "veg_type_timeseries.csv", index=False, encoding="utf-8-sig")
-        df_model = veg_ts[["gpp_anom", "sm_lag1", "spei_lag1", "veg_type"]].copy()
+        df_model = veg_ts[["gpp_anom", "sm_curr", "spei_curr", "sm_lag1", "spei_lag1", "veg_type"]].copy()
     else:
         df_model = pd.concat([
-            gpp_mean_series,
+            gpp_mean_series.rename("gpp_anom"),
+            sm_mean_series.rename("sm_curr"),
+            spei03_series.rename("spei_curr"),
             sm_mean_series.shift(1).rename("sm_lag1"),
             spei03_series.shift(1).rename("spei_lag1"),
         ], axis=1).dropna()
@@ -477,9 +509,13 @@ def main(args):
 
     result = run_xgboost_attribution(df_model, target_col="gpp_anom")
     with open(outdir / "xgboost_metrics.txt", "w", encoding="utf-8") as f:
+        f.write(f"optimizer={result['optimizer']}\n")
         f.write(f"best_params={result['best_params']}\n")
         f.write(f"rmse={result['rmse']:.4f}\n")
         f.write(f"r2={result['r2']:.4f}\n")
+
+    # 输出每个变量的重要程度
+    result["importance_df"].to_csv(outdir / "feature_importance.csv", index=False, encoding="utf-8-sig")
 
     plt.figure(figsize=(10, 4))
     plt.plot(gpp_mean_series.index, gpp_mean_series.values, label="GPP anomaly")
