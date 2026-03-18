@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 import importlib
+from osgeo import gdal
 
 import geopandas as gpd
 import matplotlib
@@ -217,6 +218,114 @@ def load_spei03_series(spei_file: str, min_lon, max_lon, min_lat, max_lat, perio
         spei03_series = spei03_series.loc[pd.to_datetime(period[0]): pd.to_datetime(period[-1])]
     return spei03_series
 
+def compute_vpd_from_t2m_dewpoint(t2m_da, d2m_da):
+    """根据ERA5 2m气温和露点温度计算VPD（kPa）。"""
+    t_c = t2m_da - 273.15
+    td_c = d2m_da - 273.15
+    es = 0.6108 * np.exp((17.27 * t_c) / (t_c + 237.3))
+    ea = 0.6108 * np.exp((17.27 * td_c) / (td_c + 237.3))
+    vpd = es - ea
+    vpd.name = "vpd"
+    return vpd
+
+
+def load_era5_variable(era5_nc, var_name, shapefile_gdf, period):
+    """读取ERA5单变量，裁剪到研究区并统一时间维。"""
+    import rioxarray  # noqa: F401
+
+    ds = xr.open_dataset(era5_nc)
+    da = ds[var_name]
+    if "valid_time" in da.coords:
+        da = da.rename({"valid_time": "time"})
+    da["time"] = da.indexes["time"].to_period("M").to_timestamp()
+    da = da.sel(time=slice(period[0], period[-1]))
+    shp = shapefile_gdf.to_crs("EPSG:4326")
+    da = da.rio.write_crs("EPSG:4326").rio.set_spatial_dims(
+        x_dim="longitude" if "longitude" in da.dims else "lon",
+        y_dim="latitude" if "latitude" in da.dims else "lat",
+    )
+    da = da.rio.clip(shp.geometry, shp.crs, drop=True, all_touched=True)
+    return da
+
+
+def load_gosif_stack(gosif_dir: Path, shapefile: gpd.GeoDataFrame, period: pd.DatetimeIndex, gosif_pattern: str):
+    """读取并裁剪GOSIF月尺度栅格。"""
+    stack = []
+    transform, crs, nodata = None, None, None
+    for t in period:
+        path = gosif_dir / gosif_pattern.format(year=t.year, month=t.month)
+        if not path.exists():
+            stack.append(None)
+            continue
+        with rasterio.open(path) as src:
+            out_image, out_transform = mask(src, [shapefile.to_crs(src.crs).geometry.unary_union], crop=True)
+            arr = out_image[0].astype(float)
+            if src.nodata is not None:
+                arr[arr == src.nodata] = np.nan
+            arr[~np.isfinite(arr)] = np.nan
+            if transform is None:
+                transform, crs, nodata = out_transform, src.crs, src.nodata
+            stack.append(arr)
+    template = next((x for x in stack if x is not None), None)
+    if template is None:
+        raise ValueError("未读取到任何 GOSIF 栅格。")
+    for i, arr in enumerate(stack):
+        if arr is None:
+            stack[i] = np.full_like(template, np.nan, dtype=float)
+    return np.stack(stack), transform, crs, nodata
+
+
+def _read_modis_cmg_layer(hdf_path: Path, subdataset_name: str):
+    ds = gdal.Open(f'HDF4_EOS:EOS_GRID:"{hdf_path}":MOD_Grid_monthly_CMG_VI:{subdataset_name}')
+    if ds is None:
+        raise ValueError(f"无法读取 MODIS 子数据集: {hdf_path.name} -> {subdataset_name}")
+    arr = ds.ReadAsArray().astype(float)
+    arr[arr == -3000] = np.nan
+    arr *= 0.0001
+    gt = ds.GetGeoTransform()
+    transform = from_origin(gt[0], gt[3], gt[1], abs(gt[5]))
+    return arr, transform
+
+
+def load_modis_evi_stack(modis_dir: Path, shapefile: gpd.GeoDataFrame, period: pd.DatetimeIndex):
+    """读取MODIS MOD13C2 EVI，并裁剪到研究区。"""
+    stack = []
+    transform, crs = None, "EPSG:4326"
+    shp = shapefile.to_crs("EPSG:4326")
+    shapes = [shp.geometry.unary_union]
+    for t in period:
+        path = modis_dir / f"MOD13C2.A{t.year:04d}.M{t.month:02d}.hdf"
+        if not path.exists():
+            stack.append(None)
+            continue
+        arr, src_transform = _read_modis_cmg_layer(path, "CMG 0.05 Deg Monthly EVI")
+        with rasterio.io.MemoryFile() as memfile:
+            with memfile.open(
+                driver="GTiff",
+                height=arr.shape[0],
+                width=arr.shape[1],
+                count=1,
+                dtype="float32",
+                crs=crs,
+                transform=src_transform,
+                nodata=np.nan,
+            ) as dataset:
+                dataset.write(arr.astype(np.float32), 1)
+                out_image, out_transform = mask(dataset, shapes, crop=True)
+                clipped = out_image[0].astype(float)
+                clipped[~np.isfinite(clipped)] = np.nan
+                if transform is None:
+                    transform = out_transform
+                stack.append(clipped)
+    template = next((x for x in stack if x is not None), None)
+    if template is None:
+        raise ValueError("未读取到任何 MODIS EVI 数据。")
+    for i, arr in enumerate(stack):
+        if arr is None:
+            stack[i] = np.full_like(template, np.nan, dtype=float)
+    return np.stack(stack), transform, crs
+
+
 
 def identify_drought_events(spei_series: pd.Series, sm_series: pd.Series, spei_thr=-0.5, sm_quantile=0.2):
     """新增：基于 SPEI+土壤湿度识别干旱事件并输出事件表。"""
@@ -424,6 +533,9 @@ def parse_args():
     parser.add_argument("--era5_path", help="ERA5-Land nc文件")
     parser.add_argument("--spei_file", help="SPEI03 nc文件")
     parser.add_argument("--landcover_tif", help="MCD12Q1 IGBP土地覆盖")
+    parser.add_argument("--modis_dir", help="MOD13C2 EVI目录")
+    parser.add_argument("--gosif_dir", help="GOSIF目录")
+    parser.add_argument("--gosif_pattern", default="GOSIF_{year:04d}.M{month:02d}.tif", help="GOSIF文件名模板")
 
     # 兼容写法：位置参数（不需要 required）
     parser.add_argument("shapefile_pos", nargs="?")
@@ -456,27 +568,58 @@ def main(args):
     period = month_range(args.start, args.end)
     min_lon, min_lat, max_lon, max_lat = shapefile.total_bounds
 
+    # ======================
+    # 1️⃣ 数据读取并统一到GPP网格
+    # ======================
     gpp_stack, gpp_transform, gpp_crs, _ = load_gpp_stack(Path(args.gpp_dir), shapefile, period, args.gpp_pattern)
-    sm1, sm2, sm3, sm4 = load_sm_era5_stack(args.era5_path, ["swvl1", "swvl2", "swvl3", "swvl4"], shapefile, period)
+
+    sm1, sm2, sm3, sm4 = load_sm_era5_stack(
+        args.era5_path, ["swvl1", "swvl2", "swvl3", "swvl4"], shapefile, period
+    )
     sm_era5_da = compute_sm_era5_xr(sm1, sm2, sm3, sm4)
     sm_era5_stack, sm_transform, sm_crs = _da_to_stack_and_transform(sm_era5_da)
-
-    # 关键修复：将 ERA5 土壤湿度统一到 GPP 网格，避免与 landcover/GPP 维度不一致
     sm_era5 = reproject_stack_to_match(
-        sm_era5_stack,
-        sm_transform,
-        sm_crs,
-        gpp_stack.shape[1:],
-        gpp_transform,
-        gpp_crs,
-        resampling=Resampling.bilinear,
+        sm_era5_stack, sm_transform, sm_crs, gpp_stack.shape[1:], gpp_transform, gpp_crs, resampling=Resampling.bilinear
     )
 
+    t2m_da = load_era5_variable(args.era5_path, "t2m", shapefile, period)
+    d2m_da = load_era5_variable(args.era5_path, "d2m", shapefile, period)
+    vpd_da = compute_vpd_from_t2m_dewpoint(t2m_da, d2m_da)
+    vpd_stack, vpd_transform, vpd_crs = _da_to_stack_and_transform(vpd_da)
+    vpd = reproject_stack_to_match(
+        vpd_stack, vpd_transform, vpd_crs, gpp_stack.shape[1:], gpp_transform, gpp_crs, resampling=Resampling.bilinear
+    )
+
+    if not args.modis_dir or not args.gosif_dir:
+        raise ValueError("请提供 --modis_dir 和 --gosif_dir，使 EVI/GOSIF 进入 XGBoost 模型。")
+
+    evi_stack, evi_transform, evi_crs = load_modis_evi_stack(Path(args.modis_dir), shapefile, period)
+    evi = reproject_stack_to_match(
+        evi_stack, evi_transform, evi_crs, gpp_stack.shape[1:], gpp_transform, gpp_crs, resampling=Resampling.bilinear
+    )
+
+    gosif_stack, gosif_transform, gosif_crs, _ = load_gosif_stack(Path(args.gosif_dir), shapefile, period, args.gosif_pattern)
+    gosif = reproject_stack_to_match(
+        gosif_stack, gosif_transform, gosif_crs, gpp_stack.shape[1:], gpp_transform, gpp_crs, resampling=Resampling.bilinear
+    )
+
+    # ======================
+    # 2️⃣ 计算异常
+    # ======================
     gpp_anom = compute_pixelwise_detrended_anomaly(gpp_stack, period)
     sm_anom = compute_pixelwise_detrended_anomaly(sm_era5, period)
+    vpd_anom = compute_pixelwise_detrended_anomaly(vpd, period)
+    evi_anom = compute_pixelwise_detrended_anomaly(evi, period)
+    gosif_anom = compute_pixelwise_detrended_anomaly(gosif, period)
 
+    # ======================
+    # 3️⃣ 区域平均时间序列
+    # ======================
     gpp_mean_series = pd.Series(np.nanmean(gpp_anom.reshape(len(period), -1), axis=1), index=period, name="gpp_anom")
     sm_mean_series = pd.Series(np.nanmean(sm_anom.reshape(len(period), -1), axis=1), index=period, name="sm_anom")
+    vpd_mean_series = pd.Series(np.nanmean(vpd_anom.reshape(len(period), -1), axis=1), index=period, name="vpd_anom")
+    evi_mean_series = pd.Series(np.nanmean(evi_anom.reshape(len(period), -1), axis=1), index=period, name="evi_anom")
+    gosif_mean_series = pd.Series(np.nanmean(gosif_anom.reshape(len(period), -1), axis=1), index=period, name="gosif_anom")
     spei03_series = load_spei03_series(args.spei_file, min_lon, max_lon, min_lat, max_lat, period)
 
     drought_events = identify_drought_events(spei03_series, sm_mean_series)
@@ -485,25 +628,55 @@ def main(args):
     rr = compute_resistance_resilience(gpp_mean_series, drought_events)
     rr.to_csv(outdir / "resistance_resilience.csv", index=False, encoding="utf-8-sig")
 
+    # ======================
+    # 4️⃣ 构建建模数据
+    # ======================
     if args.landcover_tif:
         lc = load_landcover_resampled(Path(args.landcover_tif), gpp_stack.shape[1:], gpp_transform, gpp_crs)
         lc_major = map_igbp_to_major(lc)
         veg_ts = build_vegtype_timeseries(gpp_anom, sm_anom, period, lc_major)
+        for col_name, arr in [("vpd_anom", vpd_anom), ("evi_anom", evi_anom), ("gosif_anom", gosif_anom)]:
+            vals = []
+            for veg in ["forest", "shrub", "grass", "cropland"]:
+                m = lc_major == veg
+                if np.nansum(m) == 0:
+                    continue
+                vals.append(pd.DataFrame({"time": period, "veg_type": veg, col_name: np.nanmean(np.where(m[None, :, :], arr, np.nan), axis=(1, 2))}))
+            if vals:
+                veg_ts = veg_ts.merge(pd.concat(vals, ignore_index=True), on=["time", "veg_type"], how="left")
         veg_ts = veg_ts.merge(spei03_series.rename("spei").reset_index(names="time"), on="time", how="left")
         veg_ts["sm_curr"] = veg_ts["sm_anom"]
         veg_ts["spei_curr"] = veg_ts["spei"]
+        veg_ts["vpd_curr"] = veg_ts["vpd_anom"]
+        veg_ts["evi_curr"] = veg_ts["evi_anom"]
+        veg_ts["gosif_curr"] = veg_ts["gosif_anom"]
         veg_ts["sm_lag1"] = veg_ts.groupby("veg_type")["sm_anom"].shift(1)
         veg_ts["spei_lag1"] = veg_ts.groupby("veg_type")["spei"].shift(1)
-        veg_ts = veg_ts.dropna(subset=["gpp_anom", "sm_curr", "spei_curr", "sm_lag1", "spei_lag1"])
+        veg_ts["vpd_lag1"] = veg_ts.groupby("veg_type")["vpd_anom"].shift(1)
+        veg_ts["evi_lag1"] = veg_ts.groupby("veg_type")["evi_anom"].shift(1)
+        veg_ts["gosif_lag1"] = veg_ts.groupby("veg_type")["gosif_anom"].shift(1)
+        veg_ts = veg_ts.dropna(subset=[
+            "gpp_anom", "sm_curr", "spei_curr", "vpd_curr", "evi_curr", "gosif_curr",
+            "sm_lag1", "spei_lag1", "vpd_lag1", "evi_lag1", "gosif_lag1"
+        ])
         veg_ts.to_csv(outdir / "veg_type_timeseries.csv", index=False, encoding="utf-8-sig")
-        df_model = veg_ts[["gpp_anom", "sm_curr", "spei_curr", "sm_lag1", "spei_lag1", "veg_type"]].copy()
+        df_model = veg_ts[[
+            "gpp_anom", "sm_curr", "spei_curr", "vpd_curr", "evi_curr", "gosif_curr",
+            "sm_lag1", "spei_lag1", "vpd_lag1", "evi_lag1", "gosif_lag1", "veg_type"
+        ]].copy()
     else:
         df_model = pd.concat([
             gpp_mean_series.rename("gpp_anom"),
             sm_mean_series.rename("sm_curr"),
             spei03_series.rename("spei_curr"),
+            vpd_mean_series.rename("vpd_curr"),
+            evi_mean_series.rename("evi_curr"),
+            gosif_mean_series.rename("gosif_curr"),
             sm_mean_series.shift(1).rename("sm_lag1"),
             spei03_series.shift(1).rename("spei_lag1"),
+            vpd_mean_series.shift(1).rename("vpd_lag1"),
+            evi_mean_series.shift(1).rename("evi_lag1"),
+            gosif_mean_series.shift(1).rename("gosif_lag1"),
         ], axis=1).dropna()
         df_model["veg_type"] = "mixed"
 
@@ -514,12 +687,12 @@ def main(args):
         f.write(f"rmse={result['rmse']:.4f}\n")
         f.write(f"r2={result['r2']:.4f}\n")
 
-    # 输出每个变量的重要程度
     result["importance_df"].to_csv(outdir / "feature_importance.csv", index=False, encoding="utf-8-sig")
 
     plt.figure(figsize=(10, 4))
     plt.plot(gpp_mean_series.index, gpp_mean_series.values, label="GPP anomaly")
     plt.plot(sm_mean_series.index, sm_mean_series.values, label="SM anomaly")
+    plt.plot(vpd_mean_series.index, vpd_mean_series.values, label="VPD anomaly")
     plt.legend()
     plt.tight_layout()
     plt.savefig(outdir / "timeseries_overview.png", dpi=300)
